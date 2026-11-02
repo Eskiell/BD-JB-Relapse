@@ -11,7 +11,9 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # makefs_termux is NetBSD-derived C (-std=c11, -static) that gcc-14 on
+    # ubuntu-24.04 rejects; pin to 22.04 (gcc-11) so the disc tooling builds.
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout BD-JB-Relapse
         uses: actions/checkout@v4
