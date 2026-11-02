@@ -10,7 +10,10 @@ JAR          := $(JAVA8_HOME)/bin/jar
 export JAVA8_HOME
 export JAVA11_HOME
 
-CLASSPATH     := $(BDJSDK_HOME)/target/lib/enhanced-stubs.zip:$(BDJSDK_HOME)/target/lib/bdjstack.jar:$(BDJSDK_HOME)/target/lib/rt.jar
+# Build against the open bdj-sdk stubs (same classpath the ps5-* samples use), so
+# the jar builds from public sources with no proprietary firmware jars. Override
+# CLASSPATH on the command line to compile against a real bdjstack.jar + rt.jar.
+CLASSPATH     ?= $(BDJSDK_HOME)/target/lib/enhanced-stubs.zip:$(BDJSDK_HOME)/target/lib/sony-stubs.jar
 SOURCES       := $(wildcard src/org/bdj/api/*.java) $(wildcard src/org/bdj/*.java) $(wildcard src/org/bdj/external/*.java) 
 JFLAGS        := -Xlint:-options -source 1.4 -target 1.4
 

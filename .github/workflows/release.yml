@@ -1,0 +1,66 @@
+name: Build and release Relapse.jar
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout BD-JB-Relapse
+        uses: actions/checkout@v4
+
+      - name: Checkout bdj-sdk
+        uses: actions/checkout@v4
+        with:
+          repository: john-tornblom/bdj-sdk
+          path: bdj-sdk
+
+      - name: Set up JDK 8 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      # The Relapse sources target -source/-target 1.4 (BD-J VM bytecode), which
+      # requires JDK 8. bdj-sdk ships enhanced-stubs.zip; sony-stubs.jar is built
+      # from bdj-sdk/target/src. No proprietary firmware jars are needed.
+      - name: Build sony-stubs.jar
+        run: make -C bdj-sdk/target JAVA8_HOME="$JAVA_HOME"
+
+      - name: Build Relapse.jar
+        run: make BDJSDK_HOME="$GITHUB_WORKSPACE/bdj-sdk" JAVA8_HOME="$JAVA_HOME"
+
+      - name: Sanity check (Main-Class, Java 1.4 bytecode, embedded payloads)
+        run: |
+          set -e
+          jar tf Relapse.jar | grep -q 'org/bdj/external/Relapse.class'
+          jar tf Relapse.jar | grep -q 'org/bdj/external/kexp_2026_10_26.bin'
+          jar tf Relapse.jar | grep -q 'org/bdj/external/elfldr-ps5-0.27.elf'
+          unzip -p Relapse.jar META-INF/MANIFEST.MF | grep -q 'Main-Class: org.bdj.external.Relapse'
+          unzip -p Relapse.jar org/bdj/external/Relapse.class | head -c 8 | od -An -tu1 -j6 -N2 | grep -qw 48
+          echo "Relapse.jar OK"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Relapse.jar
+          path: Relapse.jar
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Relapse.jar
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') || contains(github.ref_name, 'rc') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

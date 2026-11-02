@@ -9,8 +9,11 @@ point required.
 R/W, escalates privileges (uid 0, out of the sandbox) and starts the elfldr payload
 server.
 
-> BD-J port by **EchoStretch, zecoxao and Claude**.
+> BD-J port by **EchoStretch, zecoxao and Claude**, with the close-panic teardown
+> **fixed by 0xXOR**.
 > Original *relapse* exploit from the PS5 research community (WebKit PoC).
+
+**Version:** 1.0.0
 
 ## Supported firmware
 
@@ -47,9 +50,12 @@ several platform constraints on recent firmware:
 - **No generic `syscall()` and no writable JIT before escalation.** `pipe2` is rebuilt
   from `pipe()` + `fcntl`, and the KASLR source address is obtained via `connect()` +
   `getsockname` rather than the (unreachable) interface-list APIs.
-- **Clean teardown.** After launching the payload server the exploit restores the
-  corrupted `sysctl` OIDs, disarms the crossed pipes and releases the AIO worker
-  threads before returning.
+- **Clean teardown.** After launching the payload server the exploit gives every
+  crossed pipe back its own buffer and size (saved before the crossing) and
+  empties them, verifying each field through the slow window, so the eventual
+  `pipe_free_kmem()` unmaps the real allocation at process exit. The hijacked
+  `sysctl` OIDs cannot close the window that repairs them, so they are
+  deliberately left modified until the next boot.
 
 ## Building
 
@@ -57,26 +63,32 @@ The project builds a single payload jar (`Relapse.jar`). You need:
 
 - **JDK 8** (`javac` / `jar`) — the sources target `-source 1.4 -target 1.4`, which
   newer JDKs no longer support.
-- A BD-J SDK providing `enhanced-stubs.zip`, `bdjstack.jar` and `rt.jar` under
-  `target/lib/` (see [john-tornblom/bdj-sdk](https://github.com/john-tornblom/bdj-sdk)
-  for the toolchain layout).
+- A checkout of [john-tornblom/bdj-sdk](https://github.com/john-tornblom/bdj-sdk),
+  which ships `enhanced-stubs.zip` and builds `sony-stubs.jar` (`make -C
+  bdj-sdk/target`) under `target/lib/`. These are the same open stubs the `ps5-*`
+  samples compile against — no proprietary firmware jars are required.
 
-With the SDK laid out (`host/jdk8`, `target/lib/*`):
+With the SDK built (`sony-stubs.jar` present under `bdj-sdk/target/lib/`):
 
 ```sh
-make BDJSDK_HOME=/path/to/bdj-sdk
+make BDJSDK_HOME=/path/to/bdj-sdk JAVA8_HOME=/path/to/jdk8
 ```
 
-Or compile directly with a JDK 8 and the three jars in one folder:
+Or compile directly with a JDK 8 and the two stub archives in one folder:
 
 ```sh
 javac -Xlint:-options -source 1.4 -target 1.4 \
-  -cp "enhanced-stubs.zip:bdjstack.jar:rt.jar" \
+  -cp "enhanced-stubs.zip:sony-stubs.jar" \
   src/org/bdj/api/*.java src/org/bdj/*.java src/org/bdj/external/*.java
 jar cfm Relapse.jar manifest.txt -C src/ .
 ```
 
-(On Windows, use `;` instead of `:` in the classpath.)
+(On Windows, use `;` instead of `:` in the classpath.) To build against a real
+firmware `bdjstack.jar` + `rt.jar` instead, pass `CLASSPATH=...` to `make`.
+
+Tagged pushes are built automatically by GitHub Actions
+(`.github/workflows/release.yml`): the workflow provisions JDK 8 and the bdj-sdk
+stubs, builds `Relapse.jar`, and attaches it to the matching GitHub release.
 
 The embedded `kexp_2026_10_26.bin` and `elfldr-ps5-0.27.elf` under
 `src/org/bdj/external/` are bundled into the jar automatically.
@@ -89,14 +101,31 @@ on-console UDP logger.
 
 ## Known issues
 
-- Closing the application after running currently reboots the console during payload
-  resource teardown; power-cycling / reconnecting is the expected workflow for now.
+- Closing the application after running used to reboot the console: the crossed
+  pipes were torn down with `pipe_buffer.buffer` still pointing at the peer
+  `struct pipe`, so `pipe_free_kmem()` unmapped a UMA object as if it were the
+  pipe's buffer. The teardown now writes both pipes' own buffers and sizes back,
+  zeroes `count`/`in`/`out` and verifies every field by readback before returning.
+  This is the fix measured on firmware 12.60 upstream, but it has not yet been
+  validated on this port's 13.42 target; if a close still panics, reboot and
+  re-run.
+- The three hijacked `sysctl` OIDs remain modified until reboot. In particular
+  `kern.smp.cpus` can return a kernel address instead of the CPU count. Nothing in
+  the post-jailbreak chain has been observed to care.
+- The `sysctl` write window cannot repair the pipes and restore its own OIDs in the
+  same pass: the fast primitive overwrites the pipe field it repairs, and
+  restoring the OIDs destroys the slow window. Repairing the pipes takes priority
+  because their residue is what panics on close.
 
 ## Credits & acknowledgements
 
 - **EchoStretch, zecoxao, Claude** — BD-J port.
+- **0xXOR** — close-panic teardown fix (pipe buffer/size restore via the slow
+  `sysctl` window).
 - **relapse** — original PS5 kernel exploit (`aio_multi_wait` mode-0 UAF).
 - **ufm42** — [kexp](https://github.com/ufm42/kexp).
 - **ps5-payload-dev** — [elfldr](https://github.com/ps5-payload-dev/elfldr).
 - **john-tornblom** — [bdj-sdk](https://github.com/john-tornblom/bdj-sdk).
 - **Gezine** — BD-JB5 loader.
+- **edisnord** — [relapse-y2jb](https://github.com/edisnord/relapse-y2jb): hardware
+  analysis of the close panic and the pipe-restore method.

