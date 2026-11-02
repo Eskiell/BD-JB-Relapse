@@ -13,7 +13,7 @@ server.
 > **fixed by 0xXOR**.
 > Original *relapse* exploit from the PS5 research community (WebKit PoC).
 
-**Version:** 1.0.0
+**Version:** 2.0.0
 
 ## Supported firmware
 
@@ -88,16 +88,30 @@ firmware `bdjstack.jar` + `rt.jar` instead, pass `CLASSPATH=...` to `make`.
 
 Tagged pushes are built automatically by GitHub Actions
 (`.github/workflows/release.yml`): the workflow provisions JDK 8 and the bdj-sdk
-stubs, builds `Relapse.jar`, and attaches it to the matching GitHub release.
+stubs, builds `Relapse.jar`, then assembles a bootable disc image from
+[Gezine/BD-JB5](https://github.com/Gezine/BD-JB5) with `Relapse.jar` bundled as
+the on-disc payload, and attaches both `Relapse.jar` and `BD-JB-Relapse-<tag>.iso`
+to the matching GitHub release.
 
 The embedded `kexp_2026_10_26.bin` and `elfldr-ps5-0.27.elf` under
 `src/org/bdj/external/` are bundled into the jar automatically.
 
 ## Usage
 
-Load `Relapse.jar` with BD-JB5's remote jar loader. Once it runs, the ELF loader
-listens on **port 9021** — send your payloads there. Progress is reported over the
-on-console UDP logger.
+Each release ships two artifacts:
+
+- **`BD-JB-Relapse-<version>.iso`** — a bootable BD-RE disc built from BD-JB5 2.0
+  with `Relapse.jar` bundled on the disc as `payload.jar`. Burn it to BD-RE (or
+  serve it however you normally run a BD-J disc) and insert it in the Disc Player.
+  BD-JB5 escapes the BD-J sandbox and its `InternalJarLoader` auto-runs the bundled
+  jar from `/disc/payload.jar` — **no network push needed.** This is the easiest
+  way to run Relapse.
+- **`Relapse.jar`** — the payload on its own, for the classic flow: load it with
+  BD-JB5's **RemoteJarLoader** (`jar_client.py`, port **9025**).
+
+Either way, once Relapse runs the ELF loader listens on **port 9021** — send your
+payloads there. Progress is reported over the on-console UDP logger (BD-JB5's
+RemoteLogger, port **18194**; run its `log_client.py` first).
 
 ## Known issues
 
